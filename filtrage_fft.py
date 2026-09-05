@@ -6,7 +6,7 @@ Principe :
      (hop = L/2).
   2) Chaque trame est fenêtrée (fenêtre d'analyse), transformée par FFT.
   3) Le spectre est multiplié par un masque H(k) qui définit le filtre désiré
-     (passe-bas demi-bande, passe-haut demi-bande, coupe-bande).
+     (passe-bas demi-bande, passe-haut demi-bande, passe-bande).
   4) On revient au domaine temporel par IFFT, on refenêtre (fenêtre de
      synthèse), puis on recombine les trames traitées par overlap-add.
   5) Les fenêtres d'analyse et de synthèse sont choisies "complémentaires"
@@ -66,14 +66,12 @@ def concevoir_filtres(fs, L):
     H_passe_bas = (f_abs <= fc_demi_bande).astype(float)
     H_passe_haut = 1.0 - H_passe_bas  # complément exact du passe-bas
 
-    H_coupe_bande = np.ones(L)
-    bande = (f_abs >= 300.0) & (f_abs <= 3400.0)
-    H_coupe_bande[bande] = 0.0
+    H_passe_bande = ((f_abs >= 300.0) & (f_abs <= 3400.0)).astype(float)
 
     return {
         "passe_bas_demi_bande": H_passe_bas,
         "passe_haut_demi_bande": H_passe_haut,
-        "coupe_bande_300_3400": H_coupe_bande,
+        "passe_bande_300_3400": H_passe_bande,
     }
 
 
