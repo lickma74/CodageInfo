@@ -1,35 +1,27 @@
 """
-Partie B (avant SAW) : réduction du débit du signal du scaphandre.
+Réduction de débit : décimation x3 + quantification uniforme, avec ou sans SAW.
 
     44.1 kHz / 16 bits
-          |
-          v
-    Filtre anti-repliement (passe-bas, fc < 7350 Hz)
-          |
-          v
-    Sous-échantillonnage x3
-          |
-          v
-    14.7 kHz / 16 bits
-          |
-          v
-    Quantification scalaire uniforme (8 ou 6 bits)
+        → anti-repliement + sous-échantillonnage x3  (14.7 kHz)
+        → [pré-SAW] |X|^p
+        → quantification scalaire uniforme (8 ou 6 bits)
+        → [post-SAW] |Y|^{1/p}
 
 Réutilise quant_scal_unif() de Quantificateur.py (inchangé).
 """
 
+import os
 import numpy as np
 from scipy.io import wavfile
 from scipy.signal import firwin, filtfilt
+from scipy.signal.windows import hann
 import matplotlib.pyplot as plt
-import os
 
 from Quantificateur import quant_scal_unif
 
+SAW_P = 0.5
+SAW_L = 512
 
-# --------------------------------------------------------------------------
-# 1) Lecture / écriture de fichiers WAV
-# --------------------------------------------------------------------------
 
 def charger_wav(chemin):
     fs, x = wavfile.read(chemin)
@@ -47,150 +39,125 @@ def sauvegarder_wav(chemin, fs, x):
     wavfile.write(chemin, fs, (x_clip * 32767).astype(np.int16))
 
 
-# --------------------------------------------------------------------------
-# 2) Filtre anti-repliement / anti-imagerie (FIR, phase nulle via filtfilt)
-# --------------------------------------------------------------------------
-
 def concevoir_filtre(fs, fc, numtaps=201):
-    """
-    Filtre passe-bas FIR (fenêtre de Hamming). fc doit être < Nyquist de la
-    fréquence d'échantillonnage RÉDUITE (7350 Hz pour une décimation x3 à
-    partir de 44.1 kHz), avec une marge de sécurité.
-    """
     return firwin(numtaps, cutoff=fc, fs=fs, window="hamming")
 
 
 def filtre_antirepliement(x, fs, facteur, marge=0.9, numtaps=201):
-    """
-    fc = marge * (fs_reduit / 2), avec fs_reduit = fs / facteur.
-    marge < 1 laisse de la place pour la pente de transition du filtre FIR.
-    """
     fs_reduit = fs / facteur
     fc = marge * (fs_reduit / 2)
     taps = concevoir_filtre(fs, fc, numtaps)
     return filtfilt(taps, [1.0], x), taps, fc
 
 
-# --------------------------------------------------------------------------
-# 3) Sous-échantillonnage / suréchantillonnage
-# --------------------------------------------------------------------------
-
 def sous_echantillonner(x, facteur):
-    """Ne garde qu'un échantillon sur `facteur` (le filtrage doit être fait AVANT)."""
     return x[::facteur]
 
 
 def suréchantillonner(x, facteur, taps):
-    """
-    Insertion de zéros + filtrage passe-bas (même filtre que l'anti-repliement,
-    il sert ici d'anti-imagerie) + compensation de gain, pour ramener le
-    signal réduit à la fréquence d'origine (utile pour l'écoute comparative).
-    """
     x_zeros = np.zeros(len(x) * facteur)
     x_zeros[::facteur] = x
     return filtfilt(taps, [1.0], x_zeros) * facteur
 
 
-# --------------------------------------------------------------------------
-# 4) Pipeline complet : anti-repliement -> décimation -> quantification
-# --------------------------------------------------------------------------
+def appliquer_saw(x, exposant, L=SAW_L):
+    """STFT : |X| ** exposant, phase inchangée, overlap-add 50 %."""
+    hop = L // 2
+    w = np.sqrt(hann(L, sym=False))
+    pad = L - hop
+    x_pad = np.concatenate([np.zeros(pad), x, np.zeros(L)])
+    n_trames = 1 + (len(x_pad) - L) // hop
+    y_pad = np.zeros(len(x_pad))
+    w_sum = np.zeros(len(x_pad))
 
-def pipeline_reduction(x, fs, facteur=3, n_bits=8, pleine_echelle=1.0):
-    """
-    Retourne :
-      x_reduit   : signal quantifié à fs/facteur (valeurs en amplitude, pas indices)
-      fs_reduit  : nouvelle fréquence d'échantillonnage
-      ind        : indices de quantification (utile pour compter les niveaux/bits réellement utilisés)
-      taps       : coefficients du filtre (réutilisables pour la reconstruction)
-    """
-    x_filtre, taps, fc = filtre_antirepliement(x, fs, facteur)
+    for i in range(n_trames):
+        deb = i * hop
+        X = np.fft.rfft(x_pad[deb:deb + L] * w)
+        mag = np.maximum(np.abs(X), 1e-12)
+        Y = (mag ** exposant) * np.exp(1j * np.angle(X))
+        y_pad[deb:deb + L] += np.fft.irfft(Y, n=L) * w
+        w_sum[deb:deb + L] += w * w
+
+    mask = w_sum > 1e-8
+    y_pad[mask] /= w_sum[mask]
+    return y_pad[pad:pad + len(x)]
+
+
+def pipeline_reduction(x, fs, facteur=3, n_bits=8, pleine_echelle=1.0,
+                       utiliser_saw=False, p_saw=SAW_P):
+    x_filtre, taps, _fc = filtre_antirepliement(x, fs, facteur)
     x_decime = sous_echantillonner(x_filtre, facteur)
     fs_reduit = fs / facteur
 
-    x_reduit, ind = quant_scal_unif(x_decime, -pleine_echelle, pleine_echelle, n_bits)
+    if utiliser_saw:
+        x_pre = appliquer_saw(x_decime, p_saw)
+        x_q, ind = quant_scal_unif(x_pre, -pleine_echelle, pleine_echelle, n_bits)
+        x_decode = appliquer_saw(x_q, 1.0 / p_saw)
+    else:
+        x_q, ind = quant_scal_unif(x_decime, -pleine_echelle, pleine_echelle, n_bits)
+        x_decode = x_q
 
-    return x_reduit, fs_reduit, ind, taps
+    return x_q, fs_reduit, ind, taps, x_decode
 
 
 def reconstruire_pour_ecoute(x_reduit, facteur, taps):
-    """Remonte le signal réduit à la fréquence d'origine, pour comparaison à l'oreille."""
     return suréchantillonner(x_reduit, facteur, taps)
 
 
-# --------------------------------------------------------------------------
-# 5) Évaluation : bruit de quantification / SQNR
-# --------------------------------------------------------------------------
-
 def calculer_sqnr(x_ref, x_test):
-    """
-    SQNR = 10*log10(puissance_signal / puissance_bruit), en dB.
-    À comparer à la règle empirique ~6.02 dB/bit (+1.76 dB pour un sinus
-    plein échelle).
-    """
     n = min(len(x_ref), len(x_test))
-    erreur = x_ref[:n] - x_test[:n]
-    puissance_signal = np.mean(x_ref[:n] ** 2)
-    puissance_bruit = np.mean(erreur ** 2)
-    if puissance_bruit < 1e-20:
+    bruit = np.mean((x_ref[:n] - x_test[:n]) ** 2)
+    if bruit < 1e-20:
         return np.inf
-    return 10 * np.log10(puissance_signal / puissance_bruit)
+    return 10 * np.log10(np.mean(x_ref[:n] ** 2) / bruit)
 
-
-# --------------------------------------------------------------------------
-# 6) Programme principal
-# --------------------------------------------------------------------------
 
 def main():
-    chemin_wav = "scaphandre_44k1.wav"
-    dossier_sortie = "/mnt/user-data/outputs"
+    fichiers = ["inputs/parole.wav", "inputs/parole_2.wav"]
+    dossier_sortie = "outputs"
     os.makedirs(dossier_sortie, exist_ok=True)
-
-    if os.path.exists(chemin_wav):
-        fs, x = charger_wav(chemin_wav)
-        print(f"Fichier chargé : {chemin_wav} (fs = {fs} Hz, durée = {len(x)/fs:.2f} s)")
-    else:
-        print("Fichier introuvable : signal synthétique de démonstration (sinus + parole simulée).")
-        fs = 44100
-        t = np.arange(int(fs * 1.0)) / fs
-        x = 0.7 * np.sin(2 * np.pi * 1000 * t)  # sinus plein échelle-ish, pratique pour vérifier le SQNR théorique
-
     facteur = 3
-    resultats = {}
 
-    for n_bits in [8, 6]:
-        x_reduit, fs_reduit, ind, taps = pipeline_reduction(x, fs, facteur=facteur, n_bits=n_bits)
-        x_ecoute = reconstruire_pour_ecoute(x_reduit, facteur, taps)
+    for chemin_wav in fichiers:
+        if not os.path.exists(chemin_wav):
+            print(f"Fichier introuvable : {chemin_wav}")
+            continue
 
-        chemin_sortie = os.path.join(dossier_sortie, f"scaphandre_{n_bits}bits_reconstruit.wav")
-        sauvegarder_wav(chemin_sortie, fs, x_ecoute)
+        nom = os.path.splitext(os.path.basename(chemin_wav))[0]
+        fs, x = charger_wav(chemin_wav)
+        print(f"\n=== {nom} (fs={fs} Hz, durée={len(x)/fs:.2f} s) ===")
 
-        sqnr = calculer_sqnr(x, x_ecoute)
-        sqnr_theorique = 6.02 * n_bits + 1.76
+        resultats = {}
+        for n_bits in [8, 6]:
+            for suffixe, saw in [("sans_saw", False), ("saw", True)]:
+                _tx, _fs_r, ind, taps, x_decode = pipeline_reduction(
+                    x, fs, facteur=facteur, n_bits=n_bits, utiliser_saw=saw
+                )
+                x_ecoute = reconstruire_pour_ecoute(x_decode, facteur, taps)
+                sqnr = calculer_sqnr(x, x_ecoute)
+                chemin = os.path.join(
+                    dossier_sortie, f"{nom}_{n_bits}bits_{suffixe}.wav"
+                )
+                sauvegarder_wav(chemin, fs, x_ecoute)
+                print(f"{n_bits} bits {suffixe:10s}  SQNR={sqnr:.1f} dB  "
+                      f"niveaux={len(np.unique(ind))}/{2**n_bits}  -> {chemin}")
+                resultats[(n_bits, suffixe)] = x_ecoute
 
-        print(f"\n--- {n_bits} bits ---")
-        print(f"fs réduite       : {fs_reduit:.0f} Hz")
-        print(f"Niveaux utilisés : {len(np.unique(ind))} / {2**n_bits}")
-        print(f"SQNR mesuré      : {sqnr:.1f} dB")
-        print(f"SQNR théorique   : ~{sqnr_theorique:.1f} dB (sinus plein échelle)")
-        print(f"Sortie           : {chemin_sortie}")
-
-        resultats[n_bits] = (x_reduit, fs_reduit, x_ecoute, sqnr)
-
-    # Graphique comparatif sur un court extrait
-    n_aff = min(2000, len(x))
-    plt.figure(figsize=(10, 5))
-    plt.plot(x[:n_aff], label="Original (44.1 kHz / 16 bits)", alpha=0.8)
-    for n_bits, (_, _, x_ecoute, _) in resultats.items():
-        plt.plot(x_ecoute[:n_aff], label=f"Reconstruit ({n_bits} bits)", alpha=0.7)
-    plt.xlabel("échantillon (à 44.1 kHz)")
-    plt.ylabel("amplitude")
-    plt.title("Comparaison original vs signal réduit (8 et 6 bits)")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    chemin_fig = os.path.join(dossier_sortie, "comparaison_quantification.png")
-    plt.savefig(chemin_fig, dpi=150)
-    print(f"\nGraphique comparatif -> {chemin_fig}")
+        n_aff = min(2000, len(x))
+        plt.figure(figsize=(10, 5))
+        plt.plot(x[:n_aff], label="original 16 bits", color="k", alpha=0.8)
+        plt.plot(resultats[(6, "sans_saw")][:n_aff], label="6 bits sans SAW", alpha=0.7)
+        plt.plot(resultats[(6, "saw")][:n_aff], label="6 bits + SAW", alpha=0.7)
+        plt.xlabel("échantillon (44.1 kHz)")
+        plt.ylabel("amplitude")
+        plt.title(f"{nom} — original vs 6 bits, avec / sans SAW")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        fig_path = os.path.join(dossier_sortie, f"{nom}_comparaison_quantification.png")
+        plt.savefig(fig_path, dpi=150)
+        plt.close()
+        print(f"Figure -> {fig_path}")
 
 
 if __name__ == "__main__":
