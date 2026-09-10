@@ -20,7 +20,7 @@ Réutilise quant_scal_unif() de Quantificateur.py (inchangé).
 
 import numpy as np
 from scipy.io import wavfile
-from scipy.signal import firwin, filtfilt
+from scipy.signal import firwin, filtfilt, welch
 import matplotlib.pyplot as plt
 import os
 
@@ -136,13 +136,83 @@ def calculer_sqnr(x_ref, x_test):
     return 10 * np.log10(puissance_signal / puissance_bruit)
 
 
+def calculer_spectre_bruit(x_ref, x_test, fs, nperseg=2048):
+    """
+    Densité spectrale de puissance du bruit de quantification (méthode de
+    Welch), en dB. Utile pour vérifier si le bruit est blanc (plat) --
+    référence AVANT mise en forme (SAW), à comparer plus tard avec le bruit
+    mis en forme.
+    """
+    n = min(len(x_ref), len(x_test))
+    erreur = x_ref[:n] - x_test[:n]
+    nperseg = min(nperseg, n)
+    freqs, psd = welch(erreur, fs=fs, nperseg=nperseg)
+    psd_db = 10 * np.log10(psd + 1e-20)
+    return freqs, psd_db
+
+
 # --------------------------------------------------------------------------
-# 6) Programme principal
+# 6) Graphiques d'évaluation
+# --------------------------------------------------------------------------
+
+def tracer_snr_vs_bits(x, fs, facteur, chemin_sortie, bits_range=range(2, 13)):
+    """
+    SQNR mesuré (et théorique ~6.02*n+1.76 dB) en fonction du nombre de
+    bits par échantillon, pour visualiser la règle des ~6 dB/bit et
+    repérer où la qualité perceptuelle décroche (ex. sous 6 bits).
+    """
+    bits_liste = list(bits_range)
+    sqnr_mesure = []
+
+    for n_bits in bits_liste:
+        x_reduit, fs_reduit, ind, taps = pipeline_reduction(x, fs, facteur=facteur, n_bits=n_bits)
+        x_ecoute = reconstruire_pour_ecoute(x_reduit, facteur, taps)
+        sqnr_mesure.append(calculer_sqnr(x, x_ecoute))
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(bits_liste, sqnr_mesure, "o-", label="SQNR mesuré")
+    #plt.axvline(6, color="gray", linestyle=":", alpha=0.6, label="6 bits")
+    plt.xlabel("Nombre de bits par échantillon")
+    plt.ylabel("SQNR (dB)")
+    plt.title("SQNR en fonction du nombre de bits (quantification uniforme)")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(chemin_sortie, dpi=150)
+    plt.close()
+
+    return bits_liste, sqnr_mesure
+
+
+def tracer_spectre_bruit(x, fs, facteur, chemin_sortie, n_bits_liste=(8, 6)):
+    """Spectre (PSD, méthode de Welch) du bruit de quantification pour chaque profondeur de bits."""
+    plt.figure(figsize=(9, 5))
+
+    for n_bits in n_bits_liste:
+        x_reduit, fs_reduit, ind, taps = pipeline_reduction(x, fs, facteur=facteur, n_bits=n_bits)
+        x_ecoute = reconstruire_pour_ecoute(x_reduit, facteur, taps)
+        freqs, psd_db = calculer_spectre_bruit(x, x_ecoute, fs)
+        plt.plot(freqs, psd_db, label=f"{n_bits} bits")
+
+    plt.axvline(fs / (2 * facteur), color="gray", linestyle=":", alpha=0.6,
+                label=f"Nyquist réduite ({fs/(2*facteur):.0f} Hz)")
+    plt.xlabel("Fréquence (Hz)")
+    plt.ylabel("PSD du bruit (dB/Hz)")
+    plt.title("Spectre du bruit de quantification (sans mise en forme)")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(chemin_sortie, dpi=150)
+    plt.close()
+
+
+# --------------------------------------------------------------------------
+# 7) Programme principal
 # --------------------------------------------------------------------------
 
 def main():
-    chemin_wav = "scaphandre_44k1.wav"
-    dossier_sortie = "/mnt/user-data/outputs"
+    chemin_wav = "inputs/parole1.wav"
+    dossier_sortie = "outputs/comp"
     os.makedirs(dossier_sortie, exist_ok=True)
 
     if os.path.exists(chemin_wav):
@@ -191,6 +261,16 @@ def main():
     chemin_fig = os.path.join(dossier_sortie, "comparaison_quantification.png")
     plt.savefig(chemin_fig, dpi=150)
     print(f"\nGraphique comparatif -> {chemin_fig}")
+
+    # SQNR en fonction du nombre de bits
+    chemin_snr = os.path.join(dossier_sortie, "snr_vs_bits.png")
+    tracer_snr_vs_bits(x, fs, facteur, chemin_snr)
+    print(f"Graphique SQNR vs bits -> {chemin_snr}")
+
+    # Spectre du bruit de quantification (8 et 6 bits)
+    chemin_bruit = os.path.join(dossier_sortie, "spectre_bruit.png")
+    tracer_spectre_bruit(x, fs, facteur, chemin_bruit, n_bits_liste=[8, 6])
+    print(f"Graphique spectre du bruit -> {chemin_bruit}")
 
 
 if __name__ == "__main__":
