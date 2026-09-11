@@ -8,6 +8,7 @@ from etape6_synthese_lpc import (
     charger_wav,
     restaurer_lpc,
     tracer_diagnostic_lpc,
+    tracer_spectrogrammes,
 )
 
 DOSSIER = "outputs/etape6"
@@ -71,16 +72,16 @@ def schema_processus(chemin):
     ax.set_facecolor("white")
 
     w, h = 3.55, 1.35
-    trame = _boite(ax, 3.15, 14.7, w, h, "x[n]\ntrame fenêtrée")
-    lpc = _boite(ax, 3.15, 11.85, w, h, "LPC ordre 32\nA(z)  (enveloppe)")
-    fine = _boite(ax, 7.55, 11.85, 3.7, h, "Résidu e[n] = A(z)·x\nF0 + structure fine")
+    trame = _boite(ax, 3.15, 14.7, w, h, "x[n]\ntrames 20 ms, hop = L")
+    lpc = _boite(ax, 3.15, 11.85, w, h, "LPC ordre 32\nA(z), enveloppe H")
+    fine = _boite(ax, 7.55, 11.85, 3.7, h, "x[n] en continu\n(pas d'OLA)")
     comp = _boite(
         ax, 3.15, 8.7, w, 1.55,
-        "Compression enveloppe\nH'(f) = H(α(f)·f)\nα ≈ 1 sous 200 Hz",
-        taille=9.5,
+        "H'(f) = H(α f)\nA'(z) par Levinson",
+        taille=10,
     )
-    rec = _boite(ax, 3.15, 5.45, w, 1.45, "Synthèse\ny = (1/A'(z)) · e")
-    out = _boite(ax, 3.15, 2.35, w, h, "y[n]\nOLA 50 %")
+    rec = _boite(ax, 3.15, 5.45, w, 1.45, "Filtre A/A' + zi\ny = lfilter(A, A', x)")
+    out = _boite(ax, 3.15, 2.35, w, h, "y[n]\nvoix restaurée")
 
     y_split = (trame["bottom"] + lpc["top"]) / 2
     _chemin(ax, [(trame["cx"], trame["bottom"]), (trame["cx"], y_split)])
@@ -116,13 +117,13 @@ def schema_pipeline(chemin):
     y_haut, y_bas = 4.85, 1.55
     xs = [2.05, 5.85, 9.65, 13.45]
 
-    b0 = _boite(ax, xs[0], y_haut, w, h, "x[n]\nentrée (bloc L)")
-    b1 = _boite(ax, xs[1], y_haut, w, h, "Fenêtre analyse\nHann, saut L/2")
-    b2 = _boite(ax, xs[2], y_haut, w, h, "LPC ordre 32\nA(z) + résidu e")
-    b3 = _boite(ax, xs[3], y_haut, w, h, "Enveloppe\nH'(f) = H(α(f)·f)")
+    b0 = _boite(ax, xs[0], y_haut, w, h, "x[n]\nentrée")
+    b1 = _boite(ax, xs[1], y_haut, w, h, "Trames 20 ms\nhop = L (pas d'OLA)")
+    b2 = _boite(ax, xs[2], y_haut, w, h, "LPC ordre 32\nA(z), enveloppe H")
+    b3 = _boite(ax, xs[3], y_haut, w, h, "H'(f) = H(α f)\nα constant")
     b4 = _boite(ax, xs[0], y_bas, w, h, "Nouveau filtre\nA'(z) Levinson")
-    b5 = _boite(ax, xs[1], y_bas, w, h, "Synthèse\ny = (1/A') · e")
-    b6 = _boite(ax, xs[2], y_bas, w, h, "Fenêtre synthèse\n+ OLA 50 %")
+    b5 = _boite(ax, xs[1], y_bas, w, h, "Filtre A/A'\ny = lfilter(A, A', x)")
+    b6 = _boite(ax, xs[2], y_bas, w, h, "zi → trame suivante\n(pas d'OLA)")
     b7 = _boite(ax, xs[3], y_bas, w, h, "y[n]\nvoix restaurée")
 
     for a, b in ((b0, b1), (b1, b2), (b2, b3), (b4, b5), (b5, b6), (b6, b7)):
@@ -150,84 +151,15 @@ def diagnostic(chemin):
     tracer_diagnostic_lpc(x, fs, 2.0, chemin)
 
 
-def spectrogramme(chemin, wav="inputs/hel_fr1.wav", alpha=2.0, titre=None):
+def spectrogramme(chemin, wav="inputs/hel_fr1.wav", alpha=2.0):
     fs, x = charger_wav(wav)
     y = restaurer_lpc(x, fs, alpha)
-    fig, axes = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
-    images = []
-    for ax, sig, sous_titre in zip(
-        axes,
-        [x, y],
+    tracer_spectrogrammes(
+        x, y, fs,
         ["Original (hélium)", f"Restauré LPC (α = {alpha:g})"],
-    ):
-        _, _, _, im = ax.specgram(sig, NFFT=1024, Fs=fs, noverlap=512, cmap="magma")
-        images.append(im)
-        ax.set_ylim(0, 6000)
-        ax.set_ylabel("Fréquence (Hz)")
-        ax.set_title(sous_titre)
-    vmin, vmax = images[0].get_clim()
-    for im, ax in zip(images, axes):
-        im.set_clim(vmin, vmax)
-        fig.colorbar(im, ax=ax, label="dB")
-    axes[-1].set_xlabel("Temps (s)")
-    if titre is None:
-        titre = "Spectrogramme avant / après — LPC"
-    fig.suptitle(titre, fontsize=12, y=1.01)
-    fig.tight_layout()
-    fig.savefig(chemin, dpi=150, bbox_inches="tight", facecolor="white")
-    plt.close(fig)
-    print(f"→ {chemin}")
-
-
-def points_importants(chemin):
-    fig, ax = plt.subplots(figsize=(12.4, 8.2))
-    ax.set_xlim(0, 12)
-    ax.set_ylim(0, 10)
-    ax.axis("off")
-    fig.patch.set_facecolor("white")
-    ax.set_facecolor("white")
-    ax.text(0.45, 9.25, "Points importants", fontsize=30, color="#6aa329")
-
-    items = [
-        (
-            "Analyse LPC (source–filtre)",
-            [
-                r"La parole : $x[n] = e[n] * h[n]$  (glotte $\times$ conduit vocal)",
-                r"$X(k) = E(k)\,H(k)$  $\longrightarrow$  LPC estime $H = |G/A|$ (enveloppe lente)",
-                r"L'excitation $X/H$ garde $F_0$ et la structure fine",
-            ],
-        ),
-        (
-            "Compression de l'enveloppe",
-            [
-                r"$H'(f) = H(\alpha(f)\cdot f)$  avec $\alpha \approx 1$ sous 700 Hz, $\alpha = 2$ dès 1600 Hz",
-                "On ne déplace pas les harmoniques, seulement les formants",
-            ],
-        ),
-        (
-            "Recombinaison",
-            [
-                r"$Y(k) = X(k)\cdot H'/H$",
-                "Enveloppe compressée + harmoniques inchangés + OLA 50 %",
-            ],
-        ),
-    ]
-    y = 8.15
-    for titre, lignes in items:
-        ax.add_patch(
-            Rectangle((0.5, y - 0.14), 0.32, 0.32, fill=False, lw=1.5, edgecolor="#555")
-        )
-        ax.text(1.05, y, titre, fontsize=17, va="center", color="#333")
-        y -= 0.55
-        for ligne in lignes:
-            ax.text(1.45, y, ligne, fontsize=13.5, va="center", color="#444")
-            y -= 0.48
-        y -= 0.55
-
-    fig.tight_layout()
-    fig.savefig(chemin, dpi=180, bbox_inches="tight", facecolor="white")
-    plt.close(fig)
-    print(f"→ {chemin}")
+        chemin,
+        suptitle="Spectrogramme avant / après — LPC",
+    )
 
 
 def main():

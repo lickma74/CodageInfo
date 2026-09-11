@@ -259,7 +259,7 @@ def tracer_spectre_bruit(x, fs, facteur, chemin_sortie, n_bits_liste=(8, 6),
 # --------------------------------------------------------------------------
 
 def main():
-    chemin_wav = "inputs/parole.wav"
+    chemin_wav = "inputs/scaphandre.wav"
     dossier_sortie = "outputs/comp"
     os.makedirs(dossier_sortie, exist_ok=True)
 
@@ -270,47 +270,45 @@ def main():
         print("Fichier introuvable : signal synthétique de démonstration (sinus + parole simulée).")
         fs = 44100
         t = np.arange(int(fs * 1.0)) / fs
-        x = 0.7 * np.sin(2 * np.pi * 1000 * t)  # sinus plein échelle-ish, pratique pour vérifier le SQNR théorique
+        x = 0.7 * np.sin(2 * np.pi * 1000 * t)
 
     facteur = 3
     resultats = {}
 
     for n_bits in [8, 6]:
-        x_reduit, fs_reduit, ind, taps = pipeline_reduction(x, fs, facteur=facteur, n_bits=n_bits)
-        x_ecoute = reconstruire_pour_ecoute(x_reduit, facteur, taps)
+        for avec_saw, suffixe in ((False, "sans_saw"), (True, "saw")):
+            x_reduit, fs_reduit, ind, taps = pipeline_reduction(
+                x, fs, facteur=facteur, n_bits=n_bits, utiliser_saw=avec_saw
+            )
+            x_ecoute = reconstruire_pour_ecoute(x_reduit, facteur, taps)
+            nom = f"scaphandre_{n_bits}bits_{suffixe}.wav"
+            chemin_sortie = os.path.join(dossier_sortie, nom)
+            sauvegarder_wav(chemin_sortie, fs, x_ecoute)
+            sauvegarder_wav(os.path.join("outputs", nom), fs, x_ecoute)
 
-        chemin_sortie = os.path.join(dossier_sortie, f"scaphandre_{n_bits}bits_reconstruit.wav")
-        sauvegarder_wav(chemin_sortie, fs, x_ecoute)
+            sqnr = calculer_sqnr(x, x_ecoute)
+            print(f"\n--- {n_bits} bits {'+ SAW' if avec_saw else 'sans SAW'} ---")
+            print(f"fs réduite  : {fs_reduit:.0f} Hz")
+            print(f"SQNR        : {sqnr:.1f} dB")
+            print(f"Sortie      : {chemin_sortie}")
+            if avec_saw:
+                resultats[n_bits] = (x_reduit, fs_reduit, x_ecoute, sqnr)
 
-        sqnr = calculer_sqnr(x, x_ecoute)
-        sqnr_theorique = 6.02 * n_bits + 1.76
-
-        print(f"\n--- {n_bits} bits ---")
-        print(f"fs réduite       : {fs_reduit:.0f} Hz")
-        print(f"Niveaux utilisés : {len(np.unique(ind))} / {2**n_bits}")
-        print(f"SQNR mesuré      : {sqnr:.1f} dB")
-        print(f"SQNR théorique   : ~{sqnr_theorique:.1f} dB (sinus plein échelle)")
-        print(f"Sortie           : {chemin_sortie}")
-
-        resultats[n_bits] = (x_reduit, fs_reduit, x_ecoute, sqnr)
-
-    # Graphique comparatif sur un court extrait
     n_aff = min(2000, len(x))
     plt.figure(figsize=(10, 5))
-    plt.plot(x[:n_aff], label="Original (44.1 kHz / 16 bits)", alpha=0.8)
+    plt.plot(x[:n_aff], label="Original (scaphandre)", alpha=0.8)
     for n_bits, (_, _, x_ecoute, _) in resultats.items():
-        plt.plot(x_ecoute[:n_aff], label=f"Reconstruit ({n_bits} bits)", alpha=0.7)
-    plt.xlabel("échantillon (à 44.1 kHz)")
+        plt.plot(x_ecoute[:n_aff], label=f"SAW {n_bits} bits", alpha=0.7)
+    plt.xlabel("échantillon")
     plt.ylabel("amplitude")
-    plt.title("Comparaison original vs signal réduit (8 et 6 bits)")
+    plt.title("Original vs compression SAW (8 et 6 bits)")
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    chemin_fig = os.path.join(dossier_sortie, "comparaison_quantification.png")
+    chemin_fig = os.path.join(dossier_sortie, "comparaison_quantification_saw.png")
     plt.savefig(chemin_fig, dpi=150)
     print(f"\nGraphique comparatif -> {chemin_fig}")
 
-    # SQNR en fonction du nombre de bits (sans SAW)
     chemin_snr = os.path.join(dossier_sortie, "snr_vs_bits.png")
     tracer_snr_vs_bits(x, fs, facteur, chemin_snr, utiliser_saw=False)
     print(f"Graphique SQNR vs bits (sans SAW) -> {chemin_snr}")
@@ -319,7 +317,6 @@ def main():
     tracer_snr_vs_bits(x, fs, facteur, chemin_snr_saw, utiliser_saw=True)
     print(f"Graphique SQNR vs bits (avec SAW) -> {chemin_snr_saw}")
 
-    # Spectre du bruit de quantification (8 et 6 bits)
     chemin_bruit = os.path.join(dossier_sortie, "spectre_bruit.png")
     tracer_spectre_bruit(x, fs, facteur, chemin_bruit, n_bits_liste=[8, 6],
                          utiliser_saw=False)
