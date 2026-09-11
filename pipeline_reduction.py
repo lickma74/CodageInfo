@@ -1,19 +1,22 @@
 """
-Partie B (avant SAW) : réduction du débit du signal du scaphandre.
+Partie B : réduction du débit du signal du scaphandre, sans et avec SAW.
 
-    44.1 kHz / 16 bits
+    44.1 kHz / 16 bits  (ou 16 kHz pour parole.wav)
           |
           v
-    Filtre anti-repliement (passe-bas, fc < 7350 Hz)
+    Filtre anti-repliement (passe-bas)
           |
           v
     Sous-échantillonnage x3
           |
           v
-    14.7 kHz / 16 bits
+    [optionnel] pré-SAW : |X|^p
           |
           v
     Quantification scalaire uniforme (8 ou 6 bits)
+          |
+          v
+    [optionnel] post-SAW : |Y|^{1/p}  → mise en forme du bruit
 
 Réutilise quant_scal_unif() de Quantificateur.py (inchangé).
 """
@@ -21,10 +24,14 @@ Réutilise quant_scal_unif() de Quantificateur.py (inchangé).
 import numpy as np
 from scipy.io import wavfile
 from scipy.signal import firwin, filtfilt, welch
+from scipy.signal.windows import hann
 import matplotlib.pyplot as plt
 import os
 
 from Quantificateur import quant_scal_unif
+
+SAW_P = 0.5
+SAW_L = 512
 
 
 # --------------------------------------------------------------------------
@@ -91,23 +98,52 @@ def suréchantillonner(x, facteur, taps):
     return filtfilt(taps, [1.0], x_zeros) * facteur
 
 
+def appliquer_saw(x, exposant, L=SAW_L):
+    """STFT : |X| ** exposant, phase inchangée, overlap-add 50 %."""
+    hop = L // 2
+    w = np.sqrt(hann(L, sym=False))
+    pad = L - hop
+    x_pad = np.concatenate([np.zeros(pad), x, np.zeros(L)])
+    n_trames = 1 + (len(x_pad) - L) // hop
+    y_pad = np.zeros(len(x_pad))
+    w_sum = np.zeros(len(x_pad))
+
+    for i in range(n_trames):
+        deb = i * hop
+        X = np.fft.rfft(x_pad[deb:deb + L] * w)
+        mag = np.maximum(np.abs(X), 1e-12)
+        Y = (mag ** exposant) * np.exp(1j * np.angle(X))
+        y_pad[deb:deb + L] += np.fft.irfft(Y, n=L) * w
+        w_sum[deb:deb + L] += w * w
+
+    mask = w_sum > 1e-8
+    y_pad[mask] /= w_sum[mask]
+    return y_pad[pad:pad + len(x)]
+
+
 # --------------------------------------------------------------------------
 # 4) Pipeline complet : anti-repliement -> décimation -> quantification
 # --------------------------------------------------------------------------
 
-def pipeline_reduction(x, fs, facteur=3, n_bits=8, pleine_echelle=1.0):
+def pipeline_reduction(x, fs, facteur=3, n_bits=8, pleine_echelle=1.0,
+                       utiliser_saw=False, p_saw=SAW_P):
     """
     Retourne :
-      x_reduit   : signal quantifié à fs/facteur (valeurs en amplitude, pas indices)
+      x_reduit   : signal à fs/facteur à reconstruire (après post-SAW si activé)
       fs_reduit  : nouvelle fréquence d'échantillonnage
-      ind        : indices de quantification (utile pour compter les niveaux/bits réellement utilisés)
-      taps       : coefficients du filtre (réutilisables pour la reconstruction)
+      ind        : indices de quantification
+      taps       : coefficients du filtre
     """
     x_filtre, taps, fc = filtre_antirepliement(x, fs, facteur)
     x_decime = sous_echantillonner(x_filtre, facteur)
     fs_reduit = fs / facteur
 
-    x_reduit, ind = quant_scal_unif(x_decime, -pleine_echelle, pleine_echelle, n_bits)
+    if utiliser_saw:
+        x_pre = appliquer_saw(x_decime, p_saw)
+        x_q, ind = quant_scal_unif(x_pre, -pleine_echelle, pleine_echelle, n_bits)
+        x_reduit = appliquer_saw(x_q, 1.0 / p_saw)
+    else:
+        x_reduit, ind = quant_scal_unif(x_decime, -pleine_echelle, pleine_echelle, n_bits)
 
     return x_reduit, fs_reduit, ind, taps
 
@@ -155,26 +191,31 @@ def calculer_spectre_bruit(x_ref, x_test, fs, nperseg=2048):
 # 6) Graphiques d'évaluation
 # --------------------------------------------------------------------------
 
-def tracer_snr_vs_bits(x, fs, facteur, chemin_sortie, bits_range=range(2, 13)):
+def tracer_snr_vs_bits(x, fs, facteur, chemin_sortie, bits_range=range(2, 13),
+                      utiliser_saw=False):
     """
-    SQNR mesuré (et théorique ~6.02*n+1.76 dB) en fonction du nombre de
-    bits par échantillon, pour visualiser la règle des ~6 dB/bit et
-    repérer où la qualité perceptuelle décroche (ex. sous 6 bits).
+    SQNR mesuré en fonction du nombre de bits par échantillon.
     """
     bits_liste = list(bits_range)
     sqnr_mesure = []
 
     for n_bits in bits_liste:
-        x_reduit, fs_reduit, ind, taps = pipeline_reduction(x, fs, facteur=facteur, n_bits=n_bits)
+        x_reduit, fs_reduit, ind, taps = pipeline_reduction(
+            x, fs, facteur=facteur, n_bits=n_bits, utiliser_saw=utiliser_saw
+        )
         x_ecoute = reconstruire_pour_ecoute(x_reduit, facteur, taps)
         sqnr_mesure.append(calculer_sqnr(x, x_ecoute))
 
     plt.figure(figsize=(8, 5))
     plt.plot(bits_liste, sqnr_mesure, "o-", label="SQNR mesuré")
-    #plt.axvline(6, color="gray", linestyle=":", alpha=0.6, label="6 bits")
     plt.xlabel("Nombre de bits par échantillon")
     plt.ylabel("SQNR (dB)")
-    plt.title("SQNR en fonction du nombre de bits (quantification uniforme)")
+    titre = "SQNR en fonction du nombre de bits"
+    if utiliser_saw:
+        titre += " (quantification uniforme + SAW)"
+    else:
+        titre += " (quantification uniforme)"
+    plt.title(titre)
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -184,12 +225,15 @@ def tracer_snr_vs_bits(x, fs, facteur, chemin_sortie, bits_range=range(2, 13)):
     return bits_liste, sqnr_mesure
 
 
-def tracer_spectre_bruit(x, fs, facteur, chemin_sortie, n_bits_liste=(8, 6)):
-    """Spectre (PSD, méthode de Welch) du bruit de quantification pour chaque profondeur de bits."""
+def tracer_spectre_bruit(x, fs, facteur, chemin_sortie, n_bits_liste=(8, 6),
+                         utiliser_saw=False):
+    """Spectre (PSD, méthode de Welch) du bruit de quantification."""
     plt.figure(figsize=(9, 5))
 
     for n_bits in n_bits_liste:
-        x_reduit, fs_reduit, ind, taps = pipeline_reduction(x, fs, facteur=facteur, n_bits=n_bits)
+        x_reduit, fs_reduit, ind, taps = pipeline_reduction(
+            x, fs, facteur=facteur, n_bits=n_bits, utiliser_saw=utiliser_saw
+        )
         x_ecoute = reconstruire_pour_ecoute(x_reduit, facteur, taps)
         freqs, psd_db = calculer_spectre_bruit(x, x_ecoute, fs)
         plt.plot(freqs, psd_db, label=f"{n_bits} bits")
@@ -198,9 +242,13 @@ def tracer_spectre_bruit(x, fs, facteur, chemin_sortie, n_bits_liste=(8, 6)):
                 label=f"Nyquist réduite ({fs/(2*facteur):.0f} Hz)")
     plt.xlabel("Fréquence (Hz)")
     plt.ylabel("PSD du bruit (dB/Hz)")
-    plt.title("Spectre du bruit de quantification (sans mise en forme)")
+    if utiliser_saw:
+        plt.title("Spectre du bruit de quantification (avec mise en forme SAW)")
+    else:
+        plt.title("Spectre du bruit de quantification (sans mise en forme)")
     plt.legend()
     plt.grid(True, alpha=0.3)
+    plt.xlim(0, fs / 2)
     plt.tight_layout()
     plt.savefig(chemin_sortie, dpi=150)
     plt.close()
@@ -211,7 +259,7 @@ def tracer_spectre_bruit(x, fs, facteur, chemin_sortie, n_bits_liste=(8, 6)):
 # --------------------------------------------------------------------------
 
 def main():
-    chemin_wav = "inputs/parole1.wav"
+    chemin_wav = "inputs/parole.wav"
     dossier_sortie = "outputs/comp"
     os.makedirs(dossier_sortie, exist_ok=True)
 
@@ -262,15 +310,25 @@ def main():
     plt.savefig(chemin_fig, dpi=150)
     print(f"\nGraphique comparatif -> {chemin_fig}")
 
-    # SQNR en fonction du nombre de bits
+    # SQNR en fonction du nombre de bits (sans SAW)
     chemin_snr = os.path.join(dossier_sortie, "snr_vs_bits.png")
-    tracer_snr_vs_bits(x, fs, facteur, chemin_snr)
-    print(f"Graphique SQNR vs bits -> {chemin_snr}")
+    tracer_snr_vs_bits(x, fs, facteur, chemin_snr, utiliser_saw=False)
+    print(f"Graphique SQNR vs bits (sans SAW) -> {chemin_snr}")
+
+    chemin_snr_saw = os.path.join(dossier_sortie, "snr_vs_bits_saw.png")
+    tracer_snr_vs_bits(x, fs, facteur, chemin_snr_saw, utiliser_saw=True)
+    print(f"Graphique SQNR vs bits (avec SAW) -> {chemin_snr_saw}")
 
     # Spectre du bruit de quantification (8 et 6 bits)
     chemin_bruit = os.path.join(dossier_sortie, "spectre_bruit.png")
-    tracer_spectre_bruit(x, fs, facteur, chemin_bruit, n_bits_liste=[8, 6])
-    print(f"Graphique spectre du bruit -> {chemin_bruit}")
+    tracer_spectre_bruit(x, fs, facteur, chemin_bruit, n_bits_liste=[8, 6],
+                         utiliser_saw=False)
+    print(f"Graphique spectre du bruit (sans SAW) -> {chemin_bruit}")
+
+    chemin_bruit_saw = os.path.join(dossier_sortie, "spectre_bruit_saw.png")
+    tracer_spectre_bruit(x, fs, facteur, chemin_bruit_saw, n_bits_liste=[8, 6],
+                         utiliser_saw=True)
+    print(f"Graphique spectre du bruit (avec SAW) -> {chemin_bruit_saw}")
 
 
 if __name__ == "__main__":

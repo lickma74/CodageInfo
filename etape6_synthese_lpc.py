@@ -1,17 +1,17 @@
 """
-Étape 6 — LPC source–filtre, OLA 50 % (sans microcoupures).
+Étape 6 — LPC source–filtre, OLA 50 %.
 
-  H(ω) = |G / A(e^{jω})|     enveloppe LPC (toute la bande)
-  e implicite : X / H         excitation (F0, structure fine)
-  H'(ω) = H(α(ω)·ω)   α≈1 sous ~700 Hz, α plein dès ~1.6 kHz
-  y = IFFT( X · H'/H )
+  LPC → enveloppe H = |G/A|
+  H'(f) = H(α(f)·f)     α≈1 sous ~700 Hz, α plein dès ~1.6 kHz
+  y = IFFT( X · H'/H )  (le résidu 1/A'·e sonne très mal : on ne l'utilise pas)
 
-On ne coupe pas l'aigu. On évite seulement d'entasser F1 sous ~700 Hz.
+On ne touche pas à F0 : seule l'enveloppe LPC est compressée.
 """
 
 import os
 import numpy as np
 from scipy.io import wavfile
+from scipy.signal import lfilter, sosfilt
 from scipy.signal.windows import hann
 import matplotlib.pyplot as plt
 
@@ -22,6 +22,8 @@ ORDRE_LPC = 32
 PREEMPH = 0.97
 F_PROTECT_HZ = 700.0
 F_PLEIN_HZ = 1600.0
+F_MAX_ENV_HZ = 10000.0
+R_MAX = 0.98
 ALPHAS = (2.0, 2.5, 3.0)
 
 
@@ -93,27 +95,131 @@ def enveloppe_lpc(a, gain, nfft):
     return np.abs(gain / np.fft.rfft(A, n=nfft))
 
 
-def ratio_enveloppes(H, alpha, fs, nfft):
-    """
-    H'(f) = H(α(f)·f). α(f) → 1 sous 700 Hz (sinon F1 trop bas = étouffé),
-    α(f) = α à partir de ~1.6 kHz.
+def compresser_enveloppe(H, alpha, fs, nfft):
+    """H'(f) = H(α(f)·f), en ne lisant H que jusqu'à F_MAX_ENV_HZ.
+
+    Au-delà, l'enveloppe LPC colle du bruit / des faux formants : les ramener
+    dans la bande utile rend H' infidèle à l'enveloppe mesurée.
     """
     n = len(H)
     k = np.arange(n, dtype=np.float64)
     f = k * fs / nfft
-    a = np.ones(n)
+    af = np.ones(n)
     rampe = (f > F_PROTECT_HZ) & (f < F_PLEIN_HZ)
-    a[rampe] = 1.0 + (alpha - 1.0) * (f[rampe] - F_PROTECT_HZ) / (F_PLEIN_HZ - F_PROTECT_HZ)
-    a[f >= F_PLEIN_HZ] = alpha
-    Hw = np.interp(np.minimum(k * a, n - 1), k, H)
-    ratio = Hw / np.maximum(H, 1e-6 * np.max(H))
+    af[rampe] = 1.0 + (alpha - 1.0) * (f[rampe] - F_PROTECT_HZ) / (F_PLEIN_HZ - F_PROTECT_HZ)
+    af[f >= F_PLEIN_HZ] = alpha
+    k_max = min(n - 1, F_MAX_ENV_HZ * nfft / fs)
+    return np.interp(np.minimum(k * af, k_max), k, H)
+
+
+def ratio_enveloppes(H, alpha, fs, nfft):
+    Hp = compresser_enveloppe(H, alpha, fs, nfft)
+    ratio = Hp / np.maximum(H, 1e-6 * np.max(H))
     return np.clip(ratio, 0.05, 12.0)
+
+
+def facteur_alpha(f, alpha):
+    f = abs(float(f))
+    if f <= F_PROTECT_HZ:
+        return 1.0
+    if f >= F_PLEIN_HZ:
+        return float(alpha)
+    return 1.0 + (alpha - 1.0) * (f - F_PROTECT_HZ) / (F_PLEIN_HZ - F_PROTECT_HZ)
+
+
+def _stabiliser_poles(poles, r_max=R_MAX):
+    out = np.empty(len(poles), dtype=complex)
+    for i, p in enumerate(poles):
+        r = abs(p)
+        if r > r_max:
+            p = p * (r_max / r)
+        out[i] = p
+    return out
+
+
+def poles_lpc(a):
+    return np.roots(np.concatenate([[1.0], np.asarray(a, dtype=np.float64)]))
+
+
+def warper_poles(poles, alpha, fs, r_max=R_MAX):
+    """θ → θ/α(f). Pôles réels inchangés. Pas de poly() d'ordre 32."""
+    if abs(alpha - 1.0) < 1e-12:
+        return _stabiliser_poles(poles, r_max)
+    poles_c = []
+    for p in poles:
+        r = min(float(abs(p)), r_max)
+        theta = float(np.angle(p))
+        if abs(np.sin(theta)) < 1e-8:
+            poles_c.append(complex(r * np.sign(np.cos(theta) or 1.0)))
+            continue
+        f = abs(theta) * fs / (2.0 * np.pi)
+        af = facteur_alpha(f, alpha)
+        theta2 = theta / af
+        r2 = min(r ** af, r_max)
+        poles_c.append(r2 * np.exp(1j * theta2))
+    return _stabiliser_poles(poles_c, r_max)
+
+
+def enveloppe_poles(poles, gain, nfft):
+    omega = np.linspace(0.0, np.pi, nfft // 2 + 1)
+    zinv = np.exp(-1j * omega)
+    A = np.ones_like(zinv, dtype=complex)
+    for p in poles:
+        A *= (1.0 - p * zinv)
+    return np.abs(gain / np.maximum(np.abs(A), 1e-12))
+
+
+def synthese_poles(excitation, poles, r_max=R_MAX):
+    """y = 1/A'(z) · e, cascade SOS (stable, pas de poly d'ordre 32)."""
+    y = np.asarray(excitation, dtype=np.float64)
+    poles = list(_stabiliser_poles(poles, r_max))
+    sos = []
+    used = np.zeros(len(poles), dtype=bool)
+    for i, p in enumerate(poles):
+        if used[i]:
+            continue
+        used[i] = True
+        if abs(np.imag(p)) < 1e-8:
+            r = float(np.clip(np.real(p), -r_max, r_max))
+            sos.append([1.0, 0.0, 0.0, 1.0, -r, 0.0])
+            continue
+        for k in range(i + 1, len(poles)):
+            if not used[k] and abs(poles[k] - np.conj(p)) < 1e-5:
+                used[k] = True
+                break
+        r = min(abs(p), r_max)
+        th = np.angle(p)
+        sos.append([1.0, 0.0, 0.0, 1.0, -2.0 * r * np.cos(th), r * r])
+    if not sos:
+        return y.copy()
+    y = sosfilt(np.asarray(sos, dtype=np.float64), y)
+    if not np.all(np.isfinite(y)):
+        return np.zeros_like(excitation)
+    return y
+
+
+def residual(x, a):
+    """e = A(z) · x, filtre FIR causal."""
+    A = np.concatenate([[1.0], a])
+    return lfilter(A, [1.0], x)
+
+
+def synthetiser_trame(excitation, a):
+    """y = (1/A(z)) · e. Pas de gain G : le résidu porte déjà l'énergie."""
+    A = np.concatenate([[1.0], np.asarray(a, dtype=np.float64)])
+    if not np.all(np.isfinite(A)):
+        return np.zeros_like(excitation)
+    y = lfilter([1.0], A, excitation)
+    if not np.all(np.isfinite(y)):
+        return np.zeros_like(excitation)
+    if np.max(np.abs(y)) > 1e4 * (np.max(np.abs(excitation)) + 1e-12):
+        return np.zeros_like(excitation)
+    return y
 
 
 def restaurer_lpc(x, fs, alpha, ordre=ORDRE_LPC):
     L, hop = parametres_trame(fs)
     w = np.sqrt(hann(L, sym=False))
-    nfft = L
 
     pad = L - hop
     x_pad = np.concatenate([np.zeros(pad), x, np.zeros(L)])
@@ -131,15 +237,18 @@ def restaurer_lpc(x, fs, alpha, ordre=ORDRE_LPC):
         if rms_trame < 1e-4:
             y_hat = trame_w
         else:
-            a, gain = lpc(preaccentuer(trame_w), ordre)
+            a, gain = lpc(trame_w, ordre)
             if gain < 1e-12 or not np.all(np.isfinite(a)):
                 y_hat = trame_w
             elif abs(alpha - 1.0) < 1e-12:
                 y_hat = trame_w
             else:
+                nfft = L
                 X = np.fft.rfft(trame_w, n=nfft)
                 H = enveloppe_lpc(a, gain, nfft)
-                y_hat = np.fft.irfft(X * ratio_enveloppes(H, alpha, fs, nfft), n=nfft)[:L]
+                y_hat = np.fft.irfft(
+                    X * ratio_enveloppes(H, alpha, fs, nfft), n=nfft
+                )[:L]
                 rms_y = np.sqrt(np.mean(y_hat ** 2))
                 if np.isfinite(rms_y) and rms_y > 1e-12:
                     y_hat *= rms_trame / rms_y
@@ -158,6 +267,80 @@ def restaurer_lpc(x, fs, alpha, ordre=ORDRE_LPC):
     if peak > 0.99:
         y *= 0.99 / peak
     return y
+
+
+def tracer_diagnostic_lpc(x, fs, alpha, chemin, ordre=ORDRE_LPC, n0=None):
+    """3 cases : spectre + enveloppe, enveloppe avant/après, spectre restauré."""
+    L, hop = parametres_trame(fs)
+    w = np.sqrt(hann(L, sym=False))
+    nfft = L
+    if n0 is None:
+        best_i, best_e = 0, 0.0
+        for i in range(0, len(x) - L, hop):
+            e = np.mean((x[i:i + L] * w) ** 2)
+            if e > best_e:
+                best_e, best_i = e, i
+        n0 = best_i
+
+    trame_w = x[n0:n0 + L] * w
+    a, gain = lpc(trame_w, ordre)
+    X = np.fft.rfft(trame_w, n=nfft)
+    H = enveloppe_lpc(a, gain, nfft)
+    ratio = ratio_enveloppes(H, alpha, fs, nfft)
+    Xp = X * ratio
+    Hp = H * ratio
+    f = np.fft.rfftfreq(nfft, 1.0 / fs)
+
+    mag_x = 20 * np.log10(np.maximum(np.abs(X), 1e-12))
+    mag_h = 20 * np.log10(np.maximum(H, 1e-12))
+    mag_hp = 20 * np.log10(np.maximum(Hp, 1e-12))
+    mag_xp = 20 * np.log10(np.maximum(np.abs(Xp), 1e-12))
+    off = np.median(mag_x[: len(mag_x) // 8]) - np.median(mag_h[: len(mag_h) // 8])
+
+    fig, axes = plt.subplots(1, 3, figsize=(14.2, 4.2))
+    fig.suptitle(
+        f"Diagnostic LPC — trame à l'échantillon {n0} (α={alpha}, ordre={ordre})",
+        fontsize=12,
+    )
+
+    ax = axes[0]
+    ax.plot(f, mag_x, color="0.6", lw=0.8, label="|X(k)| (original)")
+    ax.plot(f, mag_h + off, color="C0", lw=2, label="Enveloppe LPC")
+    ax.set_xlim(0, 8000)
+    ax.set_ylim(-40, 40)
+    ax.set_xlabel("Fréquence (Hz)")
+    ax.set_ylabel("Amplitude (dB)")
+    ax.set_title("1) Spectre original + enveloppe LPC")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    ax = axes[1]
+    ax.plot(f, mag_h + off, color="C0", lw=2, label="Enveloppe mesurée (hélium)")
+    ax.plot(f, mag_hp + off, color="C1", lw=2, label=f"Enveloppe restaurée (α={alpha})")
+    ax.set_xlim(0, 8000)
+    ax.set_ylim(-40, 40)
+    ax.set_xlabel("Fréquence (Hz)")
+    ax.set_ylabel("Amplitude (dB)")
+    ax.set_title("2) Enveloppe avant / après")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    ax = axes[2]
+    ax.plot(f, mag_x, color="0.6", lw=0.9, label="|X(k)| (original)")
+    ax.plot(f, mag_xp, color="C2", lw=0.9, label="|X'(k)| (restauré)")
+    ax.plot(f, mag_hp + off, color="C1", lw=2, label="Enveloppe restaurée")
+    ax.set_xlim(0, 8000)
+    ax.set_ylim(-40, 40)
+    ax.set_xlabel("Fréquence (Hz)")
+    ax.set_ylabel("Amplitude (dB)")
+    ax.set_title("3) Spectre final")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(chemin, dpi=150)
+    plt.close(fig)
+    print(f"Diagnostic LPC -> {chemin}")
 
 
 def stats(nom, x, y):
@@ -181,7 +364,7 @@ def main():
         "hel_fr4": 2.5,
     }
 
-    print("=== LPC enveloppe + excitation (OLA 50 %) ===")
+    print("=== LPC classique : résidu + 1/A' (OLA 50 %) ===")
     print(f"Trame {DUREE_TRAME_MS} ms, recouvrement {100*RECOUVREMENT:.0f} %, "
           f"ordre LPC={ORDRE_LPC}\n")
 
@@ -211,17 +394,18 @@ def main():
         sauvegarder_wav(out0, fs, y0)
         print(f"    sortie principale (α={alpha0}) → {out0}\n")
 
-    collegue = "/Users/mshamdaoui/Downloads/hel_fr1_reconstruit_LPC 1.wav"
     fs, x = charger_wav("inputs/hel_fr1.wav")
     y = restaurer_lpc(x, fs, alpha_par_fichier["hel_fr1"])
-    panneaux = [(x, "hel_fr1 original (hélium)"), (y, "notre LPC α=2, OLA 50 %")]
-    if os.path.exists(collegue):
-        _, yc = charger_wav(collegue)
-        panneaux.append((yc, "LPC collègue (microcoupures)"))
-    fig, axes = plt.subplots(len(panneaux), 1, figsize=(11, 3.2 * len(panneaux)), sharex=True)
-    if len(panneaux) == 1:
-        axes = [axes]
-    for ax, (sig, titre) in zip(axes, panneaux):
+    tracer_diagnostic_lpc(
+        x, fs, alpha_par_fichier["hel_fr1"],
+        os.path.join(dossier, "diagnostic_lpc_hel_fr1.png"),
+    )
+    fig, axes = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
+    for ax, sig, titre in zip(
+        axes,
+        [x, y],
+        ["hel_fr1 original (hélium)", "hel_fr1 restauré LPC α=2"],
+    ):
         _, _, _, im = ax.specgram(sig, NFFT=1024, Fs=fs, noverlap=512, cmap="magma")
         ax.set_ylim(0, 6000)
         ax.set_ylabel("Hz")
