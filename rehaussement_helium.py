@@ -204,41 +204,132 @@ def generer_voyelle_synthetique(fs, duree, F0, formants, largeurs=None):
 
 
 # --------------------------------------------------------------------------
-# 7) Diagnostic visuel : enveloppe avant/après compression sur une trame
+# 7) Diagnostic visuel complet sur une trame représentative
 # --------------------------------------------------------------------------
 
-def tracer_diagnostic_enveloppe(x, fs, L, facteur_compression,
-                                 quefrence_coupure_ms, chemin_sortie):
+def _nat_vers_db(valeurs_log_naturel):
+    """Convertit un tableau de log-amplitude naturel (ln) en dB (20*log10)."""
+    return valeurs_log_naturel * 20.0 / np.log(10.0)
+
+
+def choisir_trame_energetique(x, L, hop):
+    """Retourne l'indice de début (dans x) de la trame la plus énergétique."""
+    n_trames = max((len(x) - L) // hop, 1)
+    energies = [np.sum(x[i * hop:i * hop + L] ** 2) for i in range(n_trames)]
+    i_choisi = int(np.argmax(energies)) if energies else 0
+    return i_choisi * hop
+
+
+def analyser_trame(x, fs, L, facteur_compression, quefrence_coupure_ms, deb=None):
+    """
+    Recalcule, pour UNE trame, toutes les quantités intermédiaires de
+    l'algorithme (utile pour le diagnostic, indépendant de la boucle
+    principale d'overlap-add).
+    """
     hop = L // 2
+    if deb is None:
+        deb = choisir_trame_energetique(x, L, hop)
+
     w_a, _ = fenetres_analyse_synthese(L)
     n_c = max(1, int(round(quefrence_coupure_ms * 1e-3 * fs)))
-    lifter_bas, _ = construire_lifters(L, n_c)
+    lifter_bas, lifter_haut = construire_lifters(L, n_c)
 
-    # on choisit la trame la plus énergétique (probablement voisée)
-    n_trames = (len(x) - L) // hop
-    energies = [np.sum(x[i * hop:i * hop + L] ** 2) for i in range(max(n_trames, 1))]
-    i_choisi = int(np.argmax(energies)) if energies else 0
-    deb = i_choisi * hop
     trame = x[deb:deb + L]
+    eps = 1e-8
 
     X = np.fft.fft(trame * w_a)
-    log_mag = np.log(np.abs(X) + 1e-8)
+    magnitude = np.abs(X)
+    phase = np.angle(X)
+    log_mag = np.log(magnitude + eps)
     cepstre = np.real(np.fft.ifft(log_mag))
+
     log_env = np.real(np.fft.fft(cepstre * lifter_bas))
+    log_fine = np.real(np.fft.fft(cepstre * lifter_haut))
     log_env_comprime = compresser_enveloppe(log_env, fs, L, facteur_compression)
 
+    nouvelle_log_mag = log_env_comprime + log_fine
+    nouvelle_magnitude = np.exp(nouvelle_log_mag)
+
     freqs = np.arange(L // 2 + 1) * fs / L
-    plt.figure(figsize=(9, 5))
-    plt.plot(freqs, log_env[:L // 2 + 1], label="Enveloppe mesurée (hélium)")
-    plt.plot(freqs, log_env_comprime[:L // 2 + 1], label=f"Enveloppe restaurée (÷{facteur_compression})")
-    plt.xlabel("Fréquence (Hz)")
-    plt.ylabel("log-amplitude")
-    plt.title("Enveloppe spectrale avant/après compression (trame la plus énergétique)")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(chemin_sortie, dpi=150)
-    plt.close()
+
+    return {
+        "deb": deb, "L": L, "fs": fs, "n_c": n_c,
+        "freqs": freqs,
+        "magnitude": magnitude, "log_mag": log_mag, "phase": phase,
+        "cepstre": cepstre,
+        "log_env": log_env, "log_fine": log_fine,
+        "log_env_comprime": log_env_comprime,
+        "nouvelle_magnitude": nouvelle_magnitude,
+    }
+
+
+def tracer_diagnostics_complets(x, fs, L, facteur_compression,
+                                 quefrence_coupure_ms, chemin_sortie):
+    """
+    Figure à 4 panneaux sur une trame représentative (la plus énergétique) :
+      1) magnitude du spectre original + enveloppe superposée
+      2) cepstre de la trame (avec coupure du liftering marquée)
+      3) enveloppe avant / après compression
+      4) spectre final (après traitement) vs spectre original
+    """
+    d = analyser_trame(x, fs, L, facteur_compression, quefrence_coupure_ms)
+    demi = L // 2 + 1
+    freqs = d["freqs"]
+
+    mag_db = _nat_vers_db(d["log_mag"][:demi])
+    env_db = _nat_vers_db(d["log_env"][:demi])
+    env_comp_db = _nat_vers_db(d["log_env_comprime"][:demi])
+    nouvelle_mag_db = 20 * np.log10(d["nouvelle_magnitude"][:demi] + 1e-8)
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+
+    # --- 1) Magnitude originale + enveloppe superposée ---
+    ax = axes[0, 0]
+    ax.plot(freqs, mag_db, color="tab:gray", alpha=0.6, linewidth=0.8, label="|X(k)| (original)")
+    ax.plot(freqs, env_db, color="tab:blue", linewidth=2, label="Enveloppe (mesurée)")
+    ax.set_xlabel("Fréquence (Hz)")
+    ax.set_ylabel("Amplitude (dB)")
+    ax.set_title("1) Spectre original + enveloppe")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # --- 2) Cepstre de la trame ---
+    ax = axes[0, 1]
+    n_affiche = min(L // 2, 2000)
+    ax.plot(np.arange(n_affiche), d["cepstre"][:n_affiche], color="tab:purple", linewidth=1)
+    ax.axvline(d["n_c"], color="tab:red", linestyle="--", linewidth=1,
+               label=f"coupure liftering n_c = {d['n_c']}")
+    ax.set_xlabel("Quéfrence n (échantillons)")
+    ax.set_ylabel("c[n]")
+    ax.set_title("2) Cepstre de la trame")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # --- 3) Enveloppe avant / après compression ---
+    ax = axes[1, 0]
+    ax.plot(freqs, env_db, label="Enveloppe mesurée (hélium)")
+    ax.plot(freqs, env_comp_db, label=f"Enveloppe restaurée (÷{facteur_compression})")
+    ax.set_xlabel("Fréquence (Hz)")
+    ax.set_ylabel("Amplitude (dB)")
+    ax.set_title("3) Enveloppe avant / après")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # --- 4) Spectre final vs original ---
+    ax = axes[1, 1]
+    ax.plot(freqs, mag_db, color="tab:gray", alpha=0.6, linewidth=0.8, label="|X(k)| (original)")
+    ax.plot(freqs, nouvelle_mag_db, color="tab:green", linewidth=1.2, label="|X'(k)| (restauré)")
+    ax.set_xlabel("Fréquence (Hz)")
+    ax.set_ylabel("Amplitude (dB)")
+    ax.set_title("4) Spectre final")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    fig.suptitle(f"Diagnostic cepstral — trame à l'échantillon {d['deb']} "
+                 f"(facteur={facteur_compression}, n_c={d['n_c']})")
+    fig.tight_layout()
+    fig.savefig(chemin_sortie, dpi=150)
+    plt.close(fig)
 
 
 # --------------------------------------------------------------------------
@@ -247,12 +338,12 @@ def tracer_diagnostic_enveloppe(x, fs, L, facteur_compression,
 
 def main():
     # --- Remplacer par le chemin de votre fichier de voix hélium ---
-    chemin_wav = "inputs/hel_fr4.wav"
-    dossier_sortie = "outputs"
+    chemin_wav = "inputs/hel_fr1.wav"
+    dossier_sortie = "outputs/live"
     os.makedirs(dossier_sortie, exist_ok=True)
 
     L = 1024                     # ~23 ms à 44.1 kHz, ≤ 50 ms, quasi-stationnaire
-    facteur_compression = 2.5    # entre 2 et 3, selon l'énoncé
+    facteur_compression = 2.7    # entre 2 et 3, selon l'énoncé
     quefrence_coupure_ms = 2.0   # sépare enveloppe (formants) et structure fine
 
     if os.path.exists(chemin_wav):
@@ -270,13 +361,13 @@ def main():
                                facteur_compression=facteur_compression,
                                quefrence_coupure_ms=quefrence_coupure_ms)
 
-    chemin_sortie_wav = os.path.join(dossier_sortie, "voix_restauree_4.wav")
+    chemin_sortie_wav = os.path.join(dossier_sortie, "voix_restauree.wav")
     sauvegarder_wav(chemin_sortie_wav, fs, y)
     print(f"Signal restauré -> {chemin_sortie_wav}")
 
     chemin_diag = os.path.join(dossier_sortie, "diagnostic_enveloppe.png")
-    tracer_diagnostic_enveloppe(x, fs, L, facteur_compression, quefrence_coupure_ms, chemin_diag)
-    print(f"Diagnostic (enveloppe avant/après) -> {chemin_diag}")
+    tracer_diagnostics_complets(x, fs, L, facteur_compression, quefrence_coupure_ms, chemin_diag)
+    print(f"Diagnostic complet (4 graphiques) -> {chemin_diag}")
 
     print(f"\nAmplitude max entrée  : {np.max(np.abs(x)):.4f}")
     print(f"Amplitude max sortie  : {np.max(np.abs(y)):.4f}")
