@@ -1,28 +1,28 @@
 """
-Étape 6 — Synthèse LPC complète (toutes les trames + overlap-add).
+Étape 6 — LPC source–filtre, OLA 50 % (sans microcoupures).
 
-Méthode (pôles, forme directe) :
-  1) fenêtrage √Hann
-  2) LPC → a, excitation e = A(z)·x  (lfilter causal)
-  3) compression des pôles : θ → θ/α (+ re-stabilisation)
-  4) synthèse : y = (1/A'(z)) · e   (forme directe, ordre 20)
-  5) √Hann synthèse + overlap-add
-  6) normalisation RMS ≈ entrée
+  H(ω) = |G / A(e^{jω})|     enveloppe LPC (toute la bande)
+  e implicite : X / H         excitation (F0, structure fine)
+  H'(ω) = H(α(ω)·ω)   α≈1 sous ~700 Hz, α plein dès ~1.6 kHz
+  y = IFFT( X · H'/H )
+
+On ne coupe pas l'aigu. On évite seulement d'entasser F1 sous ~700 Hz.
 """
 
 import os
 import numpy as np
 from scipy.io import wavfile
-from scipy.signal import lfilter
 from scipy.signal.windows import hann
 import matplotlib.pyplot as plt
 
 
 DUREE_TRAME_MS = 20
 RECOUVREMENT = 0.5
-ORDRE_LPC = 20
-ALPHAS = (1.5, 2.0, 2.5, 3.0)
-R_MAX = 0.985
+ORDRE_LPC = 32
+PREEMPH = 0.97
+F_PROTECT_HZ = 700.0
+F_PLEIN_HZ = 1600.0
+ALPHAS = (2.0, 2.5, 3.0)
 
 
 def charger_wav(chemin):
@@ -51,11 +51,9 @@ def parametres_trame(fs):
 
 def autocorrelation(x, ordre):
     x = np.asarray(x, dtype=np.float64)
-    n = len(x)
-    nfft = 1 << int(np.ceil(np.log2(2 * n - 1)))
-    X = np.fft.rfft(x, n=nfft)
-    r = np.fft.irfft(np.abs(X) ** 2, n=nfft)
-    return r[: ordre + 1]
+    r = np.correlate(x, x, mode="full")
+    mid = len(x) - 1
+    return r[mid:mid + ordre + 1].astype(np.float64)
 
 
 def levinson_durbin(r, ordre):
@@ -83,50 +81,39 @@ def lpc(x, ordre):
     return a, gain
 
 
-def residual(x, a):
-    return lfilter(np.concatenate([[1.0], a]), [1.0], x)
-
-
-def compresser_poles_lpc(a, alpha, r_max=R_MAX):
-    """θ → θ/α, retourne les nouveaux coeffs a (forme directe)."""
-    if abs(alpha - 1.0) < 1e-12:
-        return np.asarray(a, dtype=np.float64).copy()
-
-    poles = np.roots(np.concatenate([[1.0], np.asarray(a, dtype=np.float64)]))
-    poles_c = []
-    for p in poles:
-        r = min(float(np.abs(p)), r_max)
-        theta = float(np.angle(p)) / alpha
-        poles_c.append(r * np.exp(1j * theta))
-    A_new = np.real(np.poly(poles_c))
-    A_new = A_new / A_new[0]
-
-    poles2 = np.roots(A_new)
-    poles_s = []
-    for p in poles2:
-        mag = np.abs(p)
-        if mag >= r_max:
-            p = p * (r_max / mag)
-        poles_s.append(p)
-    A_new = np.real(np.poly(poles_s))
-    A_new = A_new / A_new[0]
-    return A_new[1:].astype(np.float64)
-
-
-def synthetiser_trame(excitation, a):
-    """Filtre tout-pôle 1/A(z) en forme directe."""
-    A = np.concatenate([[1.0], np.asarray(a, dtype=np.float64)])
-    if not np.all(np.isfinite(A)):
-        return np.zeros_like(excitation)
-    y = lfilter([1.0], A, excitation)
-    if not np.all(np.isfinite(y)):
-        return np.zeros_like(excitation)
+def preaccentuer(x, mu=PREEMPH):
+    y = np.empty_like(x)
+    y[0] = x[0]
+    y[1:] = x[1:] - mu * x[:-1]
     return y
+
+
+def enveloppe_lpc(a, gain, nfft):
+    A = np.concatenate([[1.0], a])
+    return np.abs(gain / np.fft.rfft(A, n=nfft))
+
+
+def ratio_enveloppes(H, alpha, fs, nfft):
+    """
+    H'(f) = H(α(f)·f). α(f) → 1 sous 700 Hz (sinon F1 trop bas = étouffé),
+    α(f) = α à partir de ~1.6 kHz.
+    """
+    n = len(H)
+    k = np.arange(n, dtype=np.float64)
+    f = k * fs / nfft
+    a = np.ones(n)
+    rampe = (f > F_PROTECT_HZ) & (f < F_PLEIN_HZ)
+    a[rampe] = 1.0 + (alpha - 1.0) * (f[rampe] - F_PROTECT_HZ) / (F_PLEIN_HZ - F_PROTECT_HZ)
+    a[f >= F_PLEIN_HZ] = alpha
+    Hw = np.interp(np.minimum(k * a, n - 1), k, H)
+    ratio = Hw / np.maximum(H, 1e-6 * np.max(H))
+    return np.clip(ratio, 0.05, 12.0)
 
 
 def restaurer_lpc(x, fs, alpha, ordre=ORDRE_LPC):
     L, hop = parametres_trame(fs)
     w = np.sqrt(hann(L, sym=False))
+    nfft = L
 
     pad = L - hop
     x_pad = np.concatenate([np.zeros(pad), x, np.zeros(L)])
@@ -138,25 +125,26 @@ def restaurer_lpc(x, fs, alpha, ordre=ORDRE_LPC):
 
     for i in range(n_trames):
         deb = i * hop
-        trame = x_pad[deb:deb + L]
-        trame_w = trame * w
+        trame_w = x_pad[deb:deb + L] * w
         rms_trame = np.sqrt(np.mean(trame_w ** 2))
 
         if rms_trame < 1e-4:
-            y_trame = trame_w
+            y_hat = trame_w
         else:
-            a, _gain = lpc(trame_w, ordre)
-            exc = residual(trame_w, a)
-            a_c = compresser_poles_lpc(a, alpha)
-            y_hat = synthetiser_trame(exc, a_c)
-            rms_y = np.sqrt(np.mean(y_hat ** 2))
-            if not np.isfinite(rms_y) or rms_y < 1e-12:
+            a, gain = lpc(preaccentuer(trame_w), ordre)
+            if gain < 1e-12 or not np.all(np.isfinite(a)):
+                y_hat = trame_w
+            elif abs(alpha - 1.0) < 1e-12:
                 y_hat = trame_w
             else:
-                y_hat = y_hat * (rms_trame / rms_y)
-            y_trame = y_hat * w
+                X = np.fft.rfft(trame_w, n=nfft)
+                H = enveloppe_lpc(a, gain, nfft)
+                y_hat = np.fft.irfft(X * ratio_enveloppes(H, alpha, fs, nfft), n=nfft)[:L]
+                rms_y = np.sqrt(np.mean(y_hat ** 2))
+                if np.isfinite(rms_y) and rms_y > 1e-12:
+                    y_hat *= rms_trame / rms_y
 
-        y_pad[deb:deb + L] += y_trame
+        y_pad[deb:deb + L] += y_hat * w
         w_sum[deb:deb + L] += prod
 
     mask = w_sum > 1e-8
@@ -166,11 +154,9 @@ def restaurer_lpc(x, fs, alpha, ordre=ORDRE_LPC):
     rms_in = np.sqrt(np.mean(x ** 2)) + 1e-12
     rms_out = np.sqrt(np.mean(y ** 2)) + 1e-12
     y *= rms_in / rms_out
-
     peak = np.max(np.abs(y))
     if peak > 0.99:
         y *= 0.99 / peak
-
     return y
 
 
@@ -191,13 +177,18 @@ def main():
 
     alpha_par_fichier = {
         "hel_fr1": 2.0,
-        "hel_fr2": 2.5,
-        "hel_fr4": 3.0,
+        "hel_fr2": 2.0,
+        "hel_fr4": 2.5,
     }
 
-    print("=== Restauration LPC (pôles θ/α, forme directe) + OLA ===")
+    print("=== LPC enveloppe + excitation (OLA 50 %) ===")
     print(f"Trame {DUREE_TRAME_MS} ms, recouvrement {100*RECOUVREMENT:.0f} %, "
           f"ordre LPC={ORDRE_LPC}\n")
+
+    fs, x = charger_wav("inputs/hel_fr1.wav")
+    y1 = restaurer_lpc(x, fs, 1.0)
+    corr = np.corrcoef(x, y1)[0, 1]
+    print(f"Reconstruction α=1 : corr={corr:.4f}\n")
 
     for chemin in fichiers:
         if not os.path.exists(chemin):
@@ -220,13 +211,35 @@ def main():
         sauvegarder_wav(out0, fs, y0)
         print(f"    sortie principale (α={alpha0}) → {out0}\n")
 
+    collegue = "/Users/mshamdaoui/Downloads/hel_fr1_reconstruit_LPC 1.wav"
+    fs, x = charger_wav("inputs/hel_fr1.wav")
+    y = restaurer_lpc(x, fs, alpha_par_fichier["hel_fr1"])
+    panneaux = [(x, "hel_fr1 original (hélium)"), (y, "notre LPC α=2, OLA 50 %")]
+    if os.path.exists(collegue):
+        _, yc = charger_wav(collegue)
+        panneaux.append((yc, "LPC collègue (microcoupures)"))
+    fig, axes = plt.subplots(len(panneaux), 1, figsize=(11, 3.2 * len(panneaux)), sharex=True)
+    if len(panneaux) == 1:
+        axes = [axes]
+    for ax, (sig, titre) in zip(axes, panneaux):
+        _, _, _, im = ax.specgram(sig, NFFT=1024, Fs=fs, noverlap=512, cmap="magma")
+        ax.set_ylim(0, 6000)
+        ax.set_ylabel("Hz")
+        ax.set_title(titre)
+        fig.colorbar(im, ax=ax, label="dB")
+    axes[-1].set_xlabel("temps (s)")
+    fig.tight_layout()
+    fig_path = os.path.join(dossier, "spectrogramme_avant_apres_hel_fr1.png")
+    fig.savefig(fig_path, dpi=140)
+    plt.close(fig)
+    print(f"Figure : {fig_path}")
+
     fs, x = charger_wav("inputs/hel_fr2.wav")
     y = restaurer_lpc(x, fs, alpha_par_fichier["hel_fr2"])
     fig, axes = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
     for ax, sig, titre in zip(
-        axes,
-        [x, y],
-        ["hel_fr2 original (hélium)", f"hel_fr2 restauré LPC α={alpha_par_fichier['hel_fr2']}"],
+        axes, [x, y],
+        ["hel_fr2 original (hélium)", "hel_fr2 LPC α=2, OLA 50 %"],
     ):
         _, _, _, im = ax.specgram(sig, NFFT=1024, Fs=fs, noverlap=512, cmap="magma")
         ax.set_ylim(0, 6000)
