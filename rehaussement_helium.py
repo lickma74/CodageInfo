@@ -1,23 +1,3 @@
-"""
-Restauration de la voix "hélium" par compression cepstrale de l'enveloppe
-spectrale (approche DFT/FFT).
-
-Principe (voir le schéma bloc discuté) :
-  1) Analyse par trames (overlap-add 50%, fenêtres racine de Hann
-     complémentaires).
-  2) Pour chaque trame : FFT -> magnitude/phase -> log|X(k)| -> IFFT
-     -> cepstre.
-  3) Liftering du cepstre : quéfrence basse = enveloppe spectrale
-     (formants), quéfrence haute = structure fine (F0 + harmoniques).
-  4) SEULE l'enveloppe est comprimée sur l'axe des fréquences (facteur
-     2 à 3) ; la structure fine et la phase restent inchangées.
-  5) Recombinaison (somme des log-magnitudes, puis exp), réapplication
-     de la phase d'origine, IFFT, fenêtre de synthèse, overlap-add.
-  6) Normalisation d'énergie par trame (pas de gain/atténuation).
-
-Dépendances : numpy, scipy, matplotlib (installation standard).
-"""
-
 import numpy as np
 from scipy.io import wavfile
 from scipy.signal import lfilter
@@ -47,7 +27,7 @@ def sauvegarder_wav(chemin, fs, x):
 
 
 # --------------------------------------------------------------------------
-# 2) Fenêtres d'analyse/synthèse (identique à l'exercice de filtrage FFT)
+# 2) Fenêtres d'analyse/synthèse
 # --------------------------------------------------------------------------
 
 def fenetres_analyse_synthese(L):
@@ -56,16 +36,13 @@ def fenetres_analyse_synthese(L):
 
 
 # --------------------------------------------------------------------------
-# 3) Liftering : séparation enveloppe (basse quéfrence) / structure fine
+# 3) Liftering : séparation enveloppe / structure fine
 # --------------------------------------------------------------------------
 
 def construire_lifters(L, n_c, taper=None):
     """
-    lifter_bas = 1 pour les quéfrences proches de 0 (et leur symétrique
-    proche de L) -> enveloppe spectrale.
-    lifter_haut = complément -> structure fine (F0 + harmoniques).
-    Un léger "taper" (rampe cosinus) adoucit la coupure pour limiter les
-    artefacts de type Gibbs.
+    lifter_bas = 1 pour les quéfrences proches de 0 = enveloppe spectrale.
+    lifter_haut = complément = structure fine.
     """
     if taper is None:
         taper = max(1, n_c // 4)
@@ -93,11 +70,6 @@ def compresser_enveloppe(log_env, fs, L, facteur):
     """
     Ramène l'enveloppe "dilatée" (hélium) à sa forme naturelle en
     échantillonnant log_env à des fréquences multipliées par `facteur`.
-    new_env(f) = env_mesurée(f * facteur)
-    Au-delà de fs/2/facteur (information perdue, poussée hors bande),
-    np.interp maintient la dernière valeur connue (léger applatissement,
-    inévitable).
-    Hypothèse : L pair (cas standard, ex. L=1024).
     """
     demi = L // 2 + 1
     k = np.arange(demi)
@@ -114,7 +86,7 @@ def compresser_enveloppe(log_env, fs, L, facteur):
 
 
 # --------------------------------------------------------------------------
-# 5) Cœur de l'algorithme : analyse-synthèse cepstrale par trames
+# 5) Analyse-synthèse cepstrale par trames
 # --------------------------------------------------------------------------
 
 def rehausser_voix_helium(x, fs, L=1024, facteur_compression=2.5,
@@ -151,7 +123,7 @@ def rehausser_voix_helium(x, fs, L=1024, facteur_compression=2.5,
         log_env = np.real(np.fft.fft(cepstre * lifter_bas))
         log_fine = np.real(np.fft.fft(cepstre * lifter_haut))
 
-        # --- Modification : compression de l'enveloppe SEULEMENT ---
+        # --- Modification : compression de l'enveloppe ---
         log_env_comprime = compresser_enveloppe(log_env, fs, L, facteur_compression)
 
         # --- Synthèse ---
@@ -160,7 +132,7 @@ def rehausser_voix_helium(x, fs, L=1024, facteur_compression=2.5,
         X_nouveau = nouvelle_magnitude * np.exp(1j * phase)
         y = np.real(np.fft.ifft(X_nouveau))
 
-        # --- Normalisation d'énergie (pas de gain/atténuation) ---
+        # --- Normalisation d'énergie ---
         rms_in = np.sqrt(np.mean(trame ** 2) + 1e-12)
         rms_out = np.sqrt(np.mean(y ** 2) + 1e-12)
         if rms_out > 1e-9:
@@ -175,36 +147,8 @@ def rehausser_voix_helium(x, fs, L=1024, facteur_compression=2.5,
 
     return y_pad[pad_debut:pad_debut + len(x)]
 
-
 # --------------------------------------------------------------------------
-# 6) Signal synthétique de démonstration/validation (voyelle "hélium")
-# --------------------------------------------------------------------------
-
-def generer_voyelle_synthetique(fs, duree, F0, formants, largeurs=None):
-    """Modèle source-filtre simple : train d'impulsions + résonateurs."""
-    n = int(fs * duree)
-    T0 = fs / F0
-    excitation = np.zeros(n)
-    indices = np.round(np.arange(0, n, T0)).astype(int)
-    indices = indices[indices < n]
-    excitation[indices] = 1.0
-
-    if largeurs is None:
-        largeurs = [80] * len(formants)
-
-    y = np.zeros(n)
-    for f, bw in zip(formants, largeurs):
-        r = np.exp(-np.pi * bw / fs)
-        theta = 2 * np.pi * f / fs
-        a1 = -2 * r * np.cos(theta)
-        a2 = r ** 2
-        y += lfilter([1.0], [1.0, a1, a2], excitation)
-
-    return y / np.max(np.abs(y)) * 0.8
-
-
-# --------------------------------------------------------------------------
-# 7) Diagnostic visuel complet sur une trame représentative
+# 6) Diagnostic visuel complet sur une trame représentative
 # --------------------------------------------------------------------------
 
 def _nat_vers_db(valeurs_log_naturel):
@@ -223,8 +167,7 @@ def choisir_trame_energetique(x, L, hop):
 def analyser_trame(x, fs, L, facteur_compression, quefrence_coupure_ms, deb=None):
     """
     Recalcule, pour UNE trame, toutes les quantités intermédiaires de
-    l'algorithme (utile pour le diagnostic, indépendant de la boucle
-    principale d'overlap-add).
+    l'algorithme.
     """
     hop = L // 2
     if deb is None:
@@ -266,11 +209,7 @@ def analyser_trame(x, fs, L, facteur_compression, quefrence_coupure_ms, deb=None
 def tracer_diagnostics_complets(x, fs, L, facteur_compression,
                                  quefrence_coupure_ms, chemin_sortie):
     """
-    Figure à 4 panneaux sur une trame représentative (la plus énergétique) :
-      1) magnitude du spectre original + enveloppe superposée
-      2) cepstre de la trame (avec coupure du liftering marquée)
-      3) enveloppe avant / après compression
-      4) spectre final (après traitement) vs spectre original
+    Figure à 4 panneaux sur une trame représentative.
     """
     d = analyser_trame(x, fs, L, facteur_compression, quefrence_coupure_ms)
     demi = L // 2 + 1
@@ -333,18 +272,17 @@ def tracer_diagnostics_complets(x, fs, L, facteur_compression,
 
 
 # --------------------------------------------------------------------------
-# 8) Programme principal
+# 7) Programme principal
 # --------------------------------------------------------------------------
 
 def main():
-    # --- Remplacer par le chemin de votre fichier de voix hélium ---
     chemin_wav = "inputs/hel_fr1.wav"
     dossier_sortie = "outputs/live"
     os.makedirs(dossier_sortie, exist_ok=True)
 
-    L = 1024                     # ~23 ms à 44.1 kHz, ≤ 50 ms, quasi-stationnaire
-    facteur_compression = 2.7    # entre 2 et 3, selon l'énoncé
-    quefrence_coupure_ms = 2.0   # sépare enveloppe (formants) et structure fine
+    L = 1024
+    facteur_compression = 2.7
+    quefrence_coupure_ms = 2.0
 
     if os.path.exists(chemin_wav):
         fs, x = charger_wav(chemin_wav)
@@ -355,7 +293,6 @@ def main():
         fs = 44100
         formants_normaux = [700, 1200, 2600]
         formants_helium = [f * facteur_compression for f in formants_normaux]
-        x = generer_voyelle_synthetique(fs, duree=1.5, F0=140, formants=formants_helium)
 
     y = rehausser_voix_helium(x, fs, L=L,
                                facteur_compression=facteur_compression,

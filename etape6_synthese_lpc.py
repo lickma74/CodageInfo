@@ -1,15 +1,3 @@
-"""
-Étape 6 — Synthèse LPC complète (toutes les trames + overlap-add).
-
-Méthode (pôles, forme directe) :
-  1) fenêtrage √Hann
-  2) LPC → a, excitation e = A(z)·x  (lfilter causal)
-  3) compression des pôles : θ → θ/α (+ re-stabilisation)
-  4) synthèse : y = (1/A'(z)) · e   (forme directe, ordre 20)
-  5) √Hann synthèse + overlap-add
-  6) normalisation RMS ≈ entrée
-"""
-
 import os
 import numpy as np
 from scipy.io import wavfile

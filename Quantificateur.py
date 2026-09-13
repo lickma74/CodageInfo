@@ -2,27 +2,6 @@ import numpy as np
 
 
 def quant_scal_unif(x, val_min, val_max, n_bits):
-    """
-    Quantificateur scalaire uniforme.
-
-    Paramètres
-    ----------
-    x : numpy.ndarray
-        Signal d'entrée.
-    val_min : float
-        Valeur minimale représentable.
-    val_max : float
-        Valeur maximale représentable.
-    n_bits : int
-        Nombre de bits par échantillon.
-
-    Retourne
-    --------
-    y : numpy.ndarray
-        Signal quantifié.
-    ind : numpy.ndarray
-        Indices des niveaux de quantification.
-    """
 
     n_niveaux = 2 ** n_bits
 
