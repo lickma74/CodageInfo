@@ -1,4 +1,8 @@
 /inputs/
 /outputs/
-/outputs/comp
-/outputs/live
+__pycache__/
+*.pyc
+.DS_Store
+**/.DS_Store
+.venv/
+~$*
