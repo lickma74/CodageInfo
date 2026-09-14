@@ -55,14 +55,12 @@ def sauvegarder_wav(chemin, fs, x):
 
 
 # --------------------------------------------------------------------------
-# 2) Filtre anti-repliement / anti-imagerie (FIR, phase nulle via filtfilt)
+# 2) Filtre anti-repliement
 # --------------------------------------------------------------------------
 
 def concevoir_filtre(fs, fc, numtaps=201):
     """
-    Filtre passe-bas FIR (fenêtre de Hamming). fc doit être < Nyquist de la
-    fréquence d'échantillonnage RÉDUITE (7350 Hz pour une décimation x3 à
-    partir de 44.1 kHz), avec une marge de sécurité.
+    Filtre passe-bas FIR (fenêtre de Hamming).
     """
     return firwin(numtaps, cutoff=fc, fs=fs, window="hamming")
 
@@ -70,7 +68,6 @@ def concevoir_filtre(fs, fc, numtaps=201):
 def filtre_antirepliement(x, fs, facteur, marge=0.9, numtaps=201):
     """
     fc = marge * (fs_reduit / 2), avec fs_reduit = fs / facteur.
-    marge < 1 laisse de la place pour la pente de transition du filtre FIR.
     """
     fs_reduit = fs / facteur
     fc = marge * (fs_reduit / 2)
@@ -83,15 +80,13 @@ def filtre_antirepliement(x, fs, facteur, marge=0.9, numtaps=201):
 # --------------------------------------------------------------------------
 
 def sous_echantillonner(x, facteur):
-    """Ne garde qu'un échantillon sur `facteur` (le filtrage doit être fait AVANT)."""
     return x[::facteur]
 
 
 def suréchantillonner(x, facteur, taps):
     """
-    Insertion de zéros + filtrage passe-bas (même filtre que l'anti-repliement,
-    il sert ici d'anti-imagerie) + compensation de gain, pour ramener le
-    signal réduit à la fréquence d'origine (utile pour l'écoute comparative).
+    Insertion de zéros + filtrage passe-bas (d'anti-imagerie) + compensation de gain, pour ramener le
+    signal réduit à la fréquence d'origine.
     """
     x_zeros = np.zeros(len(x) * facteur)
     x_zeros[::facteur] = x
@@ -122,7 +117,7 @@ def appliquer_saw(x, exposant, L=SAW_L):
 
 
 # --------------------------------------------------------------------------
-# 4) Pipeline complet : anti-repliement -> décimation -> quantification
+# 4) Pipeline complet
 # --------------------------------------------------------------------------
 
 def pipeline_reduction(x, fs, facteur=3, n_bits=8, pleine_echelle=1.0,
@@ -149,7 +144,7 @@ def pipeline_reduction(x, fs, facteur=3, n_bits=8, pleine_echelle=1.0,
 
 
 def reconstruire_pour_ecoute(x_reduit, facteur, taps):
-    """Remonte le signal réduit à la fréquence d'origine, pour comparaison à l'oreille."""
+    """Remonte le signal réduit à la fréquence d'origine."""
     return suréchantillonner(x_reduit, facteur, taps)
 
 
@@ -160,8 +155,6 @@ def reconstruire_pour_ecoute(x_reduit, facteur, taps):
 def calculer_sqnr(x_ref, x_test):
     """
     SQNR = 10*log10(puissance_signal / puissance_bruit), en dB.
-    À comparer à la règle empirique ~6.02 dB/bit (+1.76 dB pour un sinus
-    plein échelle).
     """
     n = min(len(x_ref), len(x_test))
     erreur = x_ref[:n] - x_test[:n]
@@ -174,10 +167,7 @@ def calculer_sqnr(x_ref, x_test):
 
 def calculer_spectre_bruit(x_ref, x_test, fs, nperseg=2048):
     """
-    Densité spectrale de puissance du bruit de quantification (méthode de
-    Welch), en dB. Utile pour vérifier si le bruit est blanc (plat) --
-    référence AVANT mise en forme (SAW), à comparer plus tard avec le bruit
-    mis en forme.
+    Densité spectrale de puissance du bruit de quantification, en dB.
     """
     n = min(len(x_ref), len(x_test))
     erreur = x_ref[:n] - x_test[:n]
